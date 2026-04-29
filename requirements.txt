@@ -1,0 +1,3 @@
+# state.py uses only Python stdlib (argparse, csv, json, pathlib, datetime).
+# No third-party deps — the OpenClaw `browser` tool drives the browser,
+# and the LLM in SKILL.md does the classification / dedup / essay writing.

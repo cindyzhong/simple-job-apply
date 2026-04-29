@@ -1,0 +1,21 @@
+# Per-user runtime state — contains credentials, PII, application history.
+# NEVER commit these.
+data/
+sessions/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*.swo
