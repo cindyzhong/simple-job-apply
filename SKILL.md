@@ -116,24 +116,45 @@ Distribute `target_count` evenly across the cartesian product of `job_titles × 
 
 Per-platform safety cap: 25 successful applications per user per day. If you hit it on a platform, stop applying on that platform for the rest of the run and continue on the other.
 
-Pacing — important for not getting flagged:
-- Wait 4–10 seconds between page actions inside a platform.
-- Wait 30–90 seconds between successful submissions.
-- Do not parallelise platforms; serial is safer.
+**Concurrency:** run LinkedIn and Indeed **in parallel** by default. Open one browser context per platform, each with its own session, queue, and per-platform daily cap, and drive them as two independent loops. Coordinate at exactly two points:
+- the shared `applied_total` counter (either loop stops when it hits `target_count`);
+- the shared in-memory dedup index (both loops consult it before opening a job).
+
+If one platform raises a session/CAPTCHA error, that loop stops; the other keeps going. The summary still names both platforms.
+
+Pacing — important for not getting flagged. **These limits are per-context** and stay in place even with concurrency:
+- Wait 4–10 seconds between page actions inside a context.
+- Wait 30–90 seconds between successful submissions inside a context.
+- Do NOT lower these just because two contexts are running concurrently — the per-context cadence is what protects against detection. Cross-context overlap is fine and expected.
 
 ---
 
 ## Step 4 — Per-job loop
 
-For each candidate job you fetch from a search result:
+Each platform loop runs the steps below independently against its own queue.
 
-### 4a. Pull metadata
-- `url` (canonical job URL — strip tracking params; keep only `currentJobId` for LinkedIn, `jk` for Indeed)
-- `company` (raw, as displayed)
-- `role` (raw, as displayed)
-- `jd_text` (full job description text)
+### 4-pre. Pre-screen the search-result card before opening it
 
-Filter to **Easy Apply** (LinkedIn) / **Apply with Indeed** only. If the apply button redirects off-platform to a company ATS, log `skipped:external_ats` and move on.
+Before clicking into any job card, scan the card itself in the search-results list for the **apply badge**. If the card does NOT show "Easy Apply" (LinkedIn) or "Apply with Indeed" (Indeed), the job redirects off-platform to a company ATS and we cannot handle it. Skip without opening:
+- LinkedIn cards: look for an element inside the card with text "Easy Apply" (e.g. `.job-card-container__footer-item:has-text('Easy Apply')`).
+- Indeed cards: look for `[data-testid="indeedApply"]` or any element on the card with text "Apply with Indeed".
+
+If the badge is absent, append `status: skipped:external_ats` (with the card URL in `notes`) to the in-memory log buffer and move to the next card. Do not open the posting. Do not pause.
+
+This catches off-platform applies before we waste 15+ seconds on a page load + DOM wait + form discovery.
+
+### 4a. Pre-fetch a batch of candidates per (platform, title)
+
+Do not click cards one at a time. When the in-memory queue for a (platform, title) pair is empty:
+1. Load the search page once (with the sort + filter URL params from Step 3).
+2. Scroll once to surface ~25 cards.
+3. Extract from every visible card in a single DOM pass: canonical URL (strip tracking — keep only `currentJobId` for LinkedIn, `jk` for Indeed), company, role, posted-time, badge presence.
+4. Push the badge-passing entries onto the in-memory queue for that (platform, title).
+5. Now iterate the queue.
+
+When the queue drains, advance pagination once (e.g. click "View next page") and repeat. **Do not re-load the search page after every applied job** — that's the previous behaviour and it's expensive.
+
+The `jd_text` is read lazily when you actually open the job in step 4c, not at queue time.
 
 ### 4b. Dedup check (use your own judgment)
 
@@ -158,7 +179,7 @@ When you detect a duplicate: **just move on quietly**. Do not pause, do not ask 
 
 Click the apply button to open the form/modal. The form may be multi-step. For each step:
 - Upload the resume from `resume_path` into any file input that looks like a resume slot.
-- For each visible question, decide what to fill using the rules in **Step 5** below.
+- **Batch-fill the step in one LLM pass** — see Step 5. Do not answer fields one at a time.
 - Click Next/Continue/Review until you reach Submit. Click Submit. Wait for the confirmation state (banner / toast / "Application sent" / new modal).
 
 If you encounter:
@@ -179,7 +200,27 @@ Then sleep 30–90 seconds before the next job.
 
 ## Step 5 — Answering form questions (the heart of the skill)
 
-For every form question you see, classify it into one of four classes and answer accordingly. If you have already answered an identical question in this run for this user, reuse the cached answer from `memory.json` — read `memory.json`, look up the SHA-1 hash of the lowercased, whitespace-collapsed question text, return the cached answer if present. Otherwise answer fresh, then write the answer back to `memory.json` so the next form gets it for free.
+**Answer all fields on a modal step in a single LLM pass.** Do not loop field-by-field — that wastes 5–12× more LLM round-trips per form. Instead, per step:
+
+1. Read every visible field in one DOM scan and produce a JSON array:
+   ```
+   [{"field_id": "...", "label": "What is your phone number?", "type": "tel", "options": null, "required": true}, ...]
+   ```
+   Use whatever stable identifier the platform exposes (`name` attribute, `aria-labelledby`, or a synthesised index) as `field_id`.
+2. Read `memory.json` once at the start of the run and keep it in working memory. For each field, compute the SHA-1 of the lowercased, whitespace-collapsed `label` and check the cache; pre-fill answers for any cache hits.
+3. For the remaining (unanswered) fields, issue **one** LLM call with this context:
+   - the array of unanswered fields,
+   - the user's `profile.json`,
+   - the JD text for this job (from step 4c),
+   - the resume text (parsed once at run start),
+   - the company and role,
+   - the four-class rules below.
+
+   Ask the LLM for a JSON array `[{"field_id": "...", "answer": "..."}]`. Each `answer` is the value to fill (string, number, or one of the field's `options`). Use the literal value `null` for any required factual field the LLM genuinely cannot resolve.
+4. Apply each answer to its field. If any answer is `null` and the field is required, emit a pending question to the user about that field, log `skipped:needs_factual`, and abandon this job.
+5. Write all newly-resolved (non-cached) answers back to `memory.json` in **one** write at the end of the step (not per-field).
+
+The four classification rules below tell the LLM *how* to answer each field; it applies them inline during the batch call.
 
 ### Class A — factual (PII, contact, location)
 Examples: full name, email, phone, address, city, ZIP, country, LinkedIn URL.
@@ -257,7 +298,7 @@ Format the JSON into a one-line chat message: applied count, per-platform breakd
 
 ## Things you must not do
 
-- Do not run multiple platforms in parallel (serial is safer).
+- Do not lower the per-context pacing (4–10 s between actions, 30–90 s between submissions) just because two contexts are running concurrently — that defeats the anti-detection purpose.
 - Do not bypass the dedup check ever.
 - Do not retry a failed login more than twice without asking the user for help.
 - Do not invent factual data (addresses, phone numbers, work history) — always read from `profile.json` or ask.
