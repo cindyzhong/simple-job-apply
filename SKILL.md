@@ -108,6 +108,12 @@ If login fails persistently (more than two attempts including a fresh code), sto
 
 Distribute `target_count` evenly across the cartesian product of `job_titles × {linkedin, indeed}`. Treat each (platform, title) as a queue. Cycle through them one job at a time — do not exhaust one queue before starting another. If a queue runs dry mid-batch, redistribute its remainder to the queues that still have results.
 
+**Sort order:** always sort search results by **most recently posted** (newest first). Stale postings are usually filled, low-response, or scraped re-listings — fresher beats more relevant for our purposes.
+- LinkedIn search URL must include `&sortBy=DD` (Date Posted, descending) on top of the Easy Apply filter `&f_AL=true`.
+- Indeed search URL must include `&sort=date`.
+
+**Title matching is loose.** Treat every job the platform surfaces in response to your query as a valid candidate — do **not** require the posted title to exactly equal the user's input title. "Senior Data Engineer", "Big Data Engineer", "Data Platform Engineer" are all valid candidates for a search of `data engineer`. The dedup, eligibility, and form-filling steps handle filtering downstream.
+
 Per-platform safety cap: 25 successful applications per user per day. If you hit it on a platform, stop applying on that platform for the rest of the run and continue on the other.
 
 Pacing — important for not getting flagged:
@@ -131,7 +137,8 @@ Filter to **Easy Apply** (LinkedIn) / **Apply with Indeed** only. If the apply b
 
 ### 4b. Dedup check (use your own judgment)
 
-Read the existing log:
+Read the existing log **once** at the start of the run and keep it in memory; don't re-read it for every job (it's append-only and you're the only writer).
+
 ```
 python3 state.py read --user_id <user_id> --kind log
 ```
@@ -145,7 +152,7 @@ Skip this job if **either**:
   - Senior/Sr./Staff/Lead qualifiers don't make a role distinct for dedup — strip them.
   - Different cities/teams within the same company at the same role title → still a duplicate for our purposes (avoid spamming one company).
 
-If skipping, append a log row `status: skipped:duplicate` with a `notes` field naming the previous match's URL. Continue.
+When you detect a duplicate: **just move on quietly**. Do not pause, do not ask the user, do not open the job posting, do not click apply. Append one log row `status: skipped:duplicate` with the previous match's URL in `notes`, then immediately fetch the next candidate. Duplicates are expected and routine — they should not slow the run down.
 
 ### 4c. Open the apply form and fill it
 
