@@ -5,19 +5,25 @@ OpenClaw skill that auto-applies to jobs on LinkedIn Easy Apply + Indeed Quick A
 ## Files
 
 ```
-SKILL.md          # The whole application: instructions to the OpenClaw agent.
-state.py          # Tiny stdin-free JSON/CSV helper invoked via `exec`. No business logic.
-data/<user>/      # Per-user state (profile, memory, log, credentials)
-sessions/<user>/  # browser-tool storage state per platform
+SKILL.md                          # Main skill instructions — always loaded.
+references/
+  form_question_rules.md          # Loaded only when filling a form step.
+  onboarding.md                   # Loaded only on first-run for a user.
+  safety.md                       # Loaded on demand.
+state.py                          # Tiny stdin-free JSON/CSV helper invoked via `exec`. No business logic.
+data/<user>/                      # Per-user state (profile, memory, log, credentials)
+sessions/<user>/                  # browser-tool storage state per platform
 ```
 
 ## How it works
 
-The OpenClaw agent reads `SKILL.md` and acts on it directly. It uses:
+The OpenClaw agent reads `SKILL.md` and acts on it directly. Long-form rules are split into `references/` so they only load when needed. It uses:
 
 - the **`browser`** tool to drive LinkedIn / Indeed,
 - the **`exec`** tool to call `python3 state.py …` for state IO,
 - the **OpenClaw chat front-end** (QQ / Telegram / Slack / etc.) to talk to the user — ask, confirm, deliver the final summary.
+
+The agent also spawns subagents — one per single application — instead of looping multiple applies inside one conversation. The parent dispatcher keeps the running counter and respawns until `target_count` is reached or both platforms are capped. This bounds each subagent's working context and lets every spawn start with a fresh prompt cache.
 
 Almost no Python logic is needed because the LLM does the classification, the
 form filling, the dedup judgment, and the essay writing in-context. `state.py`

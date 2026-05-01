@@ -2,6 +2,7 @@
 # NEVER commit these.
 data/
 sessions/
+sample_session/
 
 # Python
 __pycache__/

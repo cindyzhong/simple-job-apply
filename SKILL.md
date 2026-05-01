@@ -8,300 +8,116 @@ metadata:
       bins: ["python3"]
 ---
 
-# Job Auto-Apply Skill
+# Job Auto-Apply
 
-You apply to jobs on behalf of a specific user. You use the `browser` tool to drive LinkedIn / Indeed, the `exec` tool to read and write per-user state via `state.py`, and you talk to the user through whatever chat front-end OpenClaw is wired to (QQ, Telegram, Slack, etc. — referred to below simply as "the user").
+You apply to jobs for one user via LinkedIn Easy Apply and Indeed Quick Apply, using the `browser` tool. Per-user state lives under `<SKILL_DIR>/data/<user_id>/` and `<SKILL_DIR>/sessions/<user_id>/`.
 
-The user being served is identified by `user_id`. Do not mix users — every `state.py` call carries that `user_id`.
+`<SKILL_DIR>` is this skill's installed folder. Resolve it at runtime; every `state.py` call carries `--user_id`.
 
-`<SKILL_DIR>` below means the absolute path of this skill's installed folder (the directory that contains this `SKILL.md` and `state.py`). Resolve it at runtime — either by `cd`-ing into it before running commands, or by using whatever path OpenClaw passes you for this skill.
-
-State helper (always invoke via the `exec` tool):
+## State helper
 
 ```
-python3 <SKILL_DIR>/state.py …
+python3 <SKILL_DIR>/state.py {has_profile|read|append|set_cred} --user_id <id> [...]
 ```
 
-Per-user files (also under `<SKILL_DIR>`):
+Files: `profile.json` (PII + eligibility + skill_years + default_years), `credentials.json` (0600), `memory.json` (`{"answers": {sha→answer}}`), `job_log.csv`, `sessions/<user_id>/{linkedin,indeed}.json`.
 
-```
-<SKILL_DIR>/data/<user_id>/
-  profile.json         PII + eligibility + skill_years + default_years
-  credentials.json     {linkedin: {email,password}, indeed: {email,password}}  (chmod 0600)
-  memory.json          { "answers": { "<sha-of-question>": "<answer>" } }
-  job_log.csv          ts,platform,url,company,role,status,notes
-<SKILL_DIR>/sessions/<user_id>/
-  linkedin.json        browser-tool storage state
-  indeed.json
-```
+## Inputs to collect from the user
 
----
+`user_id`, `resume_path` (absolute PDF path), `job_titles` (list), `target_count` (int > 0). Optional: `headless` (default true).
 
-## Inputs you must collect from the user
+If titles are a single string, split on commas / and / & and confirm the parsed list back in one sentence before starting.
 
-When the user asks you to apply to jobs, confirm the following before doing anything:
+## Architecture — one subagent per single application
 
-- `user_id` — required. The account whose state you read/write.
-- `resume_path` — required, absolute path to a PDF on disk.
-- `job_titles` — required, list. e.g. `["data engineer", "big data engineer"]`.
-- `target_count` — required, integer > 0. The number of successful applications to attempt before stopping.
-- `headless` — optional bool, default true. Set false only if user asks for a debug run.
+**The parent dispatcher spawns one subagent per single application, not one subagent for the whole batch.** Each subagent runs Steps 0–4 below for exactly one job, reports `applied | skipped:<reason>`, then exits. The parent keeps the running counter and respawns until `target_count` is reached or both platforms are capped.
 
-If the user provides a single string of titles, split on commas/and/&. Confirm the parsed list back to them in one sentence before starting.
+This bounds each subagent's working context to a single posting and lets each one start with a fresh prompt cache. **Do not loop multiple applications inside one subagent** — that is what blew up prior runs.
 
----
+The parent may run LinkedIn and Indeed subagents concurrently, but each individual subagent applies to exactly one job.
 
-## Step 1 — Bootstrap (only if profile.json is missing)
+## Step 0 — Preload (once per subagent)
 
-Run:
+1. `state.py has_profile`. If false, follow `references/onboarding.md`, then continue.
+2. Read `job_log.csv` once → in-memory dedup index.
+3. Read `memory.json` once → in-memory answer cache.
+4. Parse the resume PDF text once and keep it in working memory.
 
-```
-python3 state.py has_profile --user_id <user_id>
-```
+## Step 1 — Login (once per subagent, per platform)
 
-If `exists` is false, you must onboard this user before applying. Ask them the questions below in chat, **one or two at a time** to keep the conversation natural. Save batched answers to `profile.json` as you go (read the current profile, merge, write it back). Capture credentials with `state.py set_cred ...` (this enforces 0600 on disk).
+Open the platform with stored session state from `sessions/<user_id>/<platform>.json`. If you see signed-in chrome, continue. Otherwise read credentials and submit the login form. On a 2FA / email-PIN challenge, ask the user once, wait, type it in. After two failed attempts, stop and reply: `Could not log in to <platform> for <user_id>. Please re-run bootstrap to update credentials.`
 
-Required identity fields → save in `profile.json`:
-- `first_name`, `last_name`, `phone` (with country code), `address`, `city`, `state`, `zip`, `country`, `linkedin_url`, `github_url` (or empty), `portfolio_url` (or empty)
+Save session state on success.
 
-Required eligibility fields (always ask; these are stable):
-- `work_authorization` — Yes/No
-- `sponsorship_now` — Yes/No
-- `sponsorship_future` — Yes/No
-- `willing_relocate` — Yes/No
-- `work_mode` — Remote / Hybrid / Onsite / Any
+## Step 2 — Find one candidate
 
-Required compensation/timing:
-- `salary_expectation` — number or short range
-- `notice_period` — short text (default "Two weeks" if user defers)
+Sort by most recent (LinkedIn `&sortBy=DD&f_AL=true`, Indeed `&sort=date`). Load the search page, scroll once for ~25 cards, extract from cards in **one DOM pass**: canonical URL (strip tracking — keep `currentJobId` for LinkedIn, `jk` for Indeed), company, role, posted-time, badge presence.
 
-Required experience baseline:
-- `default_years` — integer years of overall experience (used when a JD doesn't specify)
-- `skill_years` — JSON object mapping skill→years, e.g. `{"python":7,"sql":6,"airflow":4}`. Ask for top 5–10 skills the user wants to emphasise.
+**Pre-screen in the list:** if the card lacks "Easy Apply" (LinkedIn) or "Apply with Indeed" (Indeed), the job redirects to an external ATS. Log `skipped:external_ats` (URL in `notes`) and try the next card. Do not open the posting.
 
-EEO / demographic — default to "Decline to answer" unless the user explicitly overrides:
-- `veteran_status`, `disability_status`, `gender`, `race_ethnicity`
+Title match is loose: any job the platform surfaces is a valid candidate. Filtering happens at dedup and form-fill time.
 
-Credentials (collect both per platform):
-- LinkedIn email + password → `state.py set_cred --user_id X --platform linkedin --email E --password P`
-- Indeed email + password   → `state.py set_cred --user_id X --platform indeed   --email E --password P`
+## Step 3 — Dedup
 
-Confirm the saved profile back to the user in one short message ("Saved your profile. Ready when you are."), then continue.
+Skip if **either**:
+- the canonical URL is in the dedup index with status `applied`, OR
+- a `(company, role)` pair is in the index with status `applied` and you judge them the same opportunity. Strip Sr/Senior/Staff/Lead. Treat aliases as one (Alphabet ≡ Google ≡ Google LLC; Meta ≡ Facebook; Data Engineer ≡ Big Data Engineer ≡ Data Platform Engineer at the same company).
 
----
+On dedup: log `skipped:duplicate` (matched URL in `notes`) and try the next card. Do not open the posting, do not pause.
 
-## Step 2 — Login (per platform, once per run)
+## Step 4 — Apply to the chosen job
 
-For each of LinkedIn and Indeed:
+Click Apply. For each form step:
 
-1. Open the platform with the `browser` tool, loading storage state from `sessions/<user_id>/<platform>.json` if present.
-2. Navigate to the home/feed. If you see signed-in chrome (your profile menu, "Me", "Sign out"), you're done — proceed.
-3. Otherwise, read the credentials with `state.py read --user_id X --kind credentials`. Submit the login form.
-4. If the platform challenges with a 2FA code or email-PIN, **ask the user**: "LinkedIn (or Indeed) is asking for a one-time code. Please reply with it." Wait for their reply, type it in, submit. Do not retry blindly if the code is rejected — ask again.
-5. Once signed in, save storage state back to `sessions/<user_id>/<platform>.json` so the next run skips login.
+1. Upload the resume from `resume_path` into any resume-shaped file input.
+2. Read every visible field in one DOM scan and batch-fill per `references/form_question_rules.md`.
+3. Click Next/Continue/Review.
 
-If login fails persistently (more than two attempts including a fresh code), stop the run and reply: `Could not log in to <platform> for <user_id>. Please re-run bootstrap to update credentials.` Do not continue to the apply step.
+**After clicking Next, the previous step's DOM is no longer relevant.** Do not re-read it, do not reference it. Treat each step as a fresh page. This keeps the subagent's working context bounded.
 
----
-
-## Step 3 — Plan the search (round-robin)
-
-Distribute `target_count` evenly across the cartesian product of `job_titles × {linkedin, indeed}`. Treat each (platform, title) as a queue. Cycle through them one job at a time — do not exhaust one queue before starting another. If a queue runs dry mid-batch, redistribute its remainder to the queues that still have results.
-
-**Sort order:** always sort search results by **most recently posted** (newest first). Stale postings are usually filled, low-response, or scraped re-listings — fresher beats more relevant for our purposes.
-- LinkedIn search URL must include `&sortBy=DD` (Date Posted, descending) on top of the Easy Apply filter `&f_AL=true`.
-- Indeed search URL must include `&sort=date`.
-
-**Title matching is loose.** Treat every job the platform surfaces in response to your query as a valid candidate — do **not** require the posted title to exactly equal the user's input title. "Senior Data Engineer", "Big Data Engineer", "Data Platform Engineer" are all valid candidates for a search of `data engineer`. The dedup, eligibility, and form-filling steps handle filtering downstream.
-
-Per-platform safety cap: 25 successful applications per user per day. If you hit it on a platform, stop applying on that platform for the rest of the run and continue on the other.
-
-**Concurrency:** run LinkedIn and Indeed **in parallel** by default. Open one browser context per platform, each with its own session, queue, and per-platform daily cap, and drive them as two independent loops. Coordinate at exactly two points:
-- the shared `applied_total` counter (either loop stops when it hits `target_count`);
-- the shared in-memory dedup index (both loops consult it before opening a job).
-
-If one platform raises a session/CAPTCHA error, that loop stops; the other keeps going. The summary still names both platforms.
-
-Pacing — important for not getting flagged. **These limits are per-context** and stay in place even with concurrency:
-- Wait 4–10 seconds between page actions inside a context.
-- Wait 30–90 seconds between successful submissions inside a context.
-- Do NOT lower these just because two contexts are running concurrently — the per-context cadence is what protects against detection. Cross-context overlap is fine and expected.
-
----
-
-## Step 4 — Per-job loop
-
-Each platform loop runs the steps below independently against its own queue.
-
-### 4-pre. Pre-screen the search-result card before opening it
-
-Before clicking into any job card, scan the card itself in the search-results list for the **apply badge**. If the card does NOT show "Easy Apply" (LinkedIn) or "Apply with Indeed" (Indeed), the job redirects off-platform to a company ATS and we cannot handle it. Skip without opening:
-- LinkedIn cards: look for an element inside the card with text "Easy Apply" (e.g. `.job-card-container__footer-item:has-text('Easy Apply')`).
-- Indeed cards: look for `[data-testid="indeedApply"]` or any element on the card with text "Apply with Indeed".
-
-If the badge is absent, append `status: skipped:external_ats` (with the card URL in `notes`) to the in-memory log buffer and move to the next card. Do not open the posting. Do not pause.
-
-This catches off-platform applies before we waste 15+ seconds on a page load + DOM wait + form discovery.
-
-### 4a. Pre-fetch a batch of candidates per (platform, title)
-
-Do not click cards one at a time. When the in-memory queue for a (platform, title) pair is empty:
-1. Load the search page once (with the sort + filter URL params from Step 3).
-2. Scroll once to surface ~25 cards.
-3. Extract from every visible card in a single DOM pass: canonical URL (strip tracking — keep only `currentJobId` for LinkedIn, `jk` for Indeed), company, role, posted-time, badge presence.
-4. Push the badge-passing entries onto the in-memory queue for that (platform, title).
-5. Now iterate the queue.
-
-When the queue drains, advance pagination once (e.g. click "View next page") and repeat. **Do not re-load the search page after every applied job** — that's the previous behaviour and it's expensive.
-
-The `jd_text` is read lazily when you actually open the job in step 4c, not at queue time.
-
-### 4b. Dedup check (use your own judgment)
-
-Read the existing log **once** at the start of the run and keep it in memory; don't re-read it for every job (it's append-only and you're the only writer).
-
-```
-python3 state.py read --user_id <user_id> --kind log
-```
-
-Skip this job if **either**:
-- the canonical URL already appears with status `applied`, OR
-- the (company, role) pair already appears with status `applied` and you judge them to be the same opportunity. Use real-world business sense:
-  - "Alphabet Inc." ≡ "Google" ≡ "Google LLC"
-  - "Meta Platforms" ≡ "Facebook" ≡ "Meta"
-  - "Big Data Engineer" ≡ "Data Engineer" ≡ "Data Platform Engineer" ≡ "Data Infra Engineer" (when at the same company)
-  - Senior/Sr./Staff/Lead qualifiers don't make a role distinct for dedup — strip them.
-  - Different cities/teams within the same company at the same role title → still a duplicate for our purposes (avoid spamming one company).
-
-When you detect a duplicate: **just move on quietly**. Do not pause, do not ask the user, do not open the job posting, do not click apply. Append one log row `status: skipped:duplicate` with the previous match's URL in `notes`, then immediately fetch the next candidate. Duplicates are expected and routine — they should not slow the run down.
-
-### 4c. Open the apply form and fill it
-
-Click the apply button to open the form/modal. The form may be multi-step. For each step:
-- Upload the resume from `resume_path` into any file input that looks like a resume slot.
-- **Batch-fill the step in one LLM pass** — see Step 5. Do not answer fields one at a time.
-- Click Next/Continue/Review until you reach Submit. Click Submit. Wait for the confirmation state (banner / toast / "Application sent" / new modal).
+Continue until you reach Submit. Click Submit, wait for the confirmation state (banner / toast / "Application sent" / new modal).
 
 If you encounter:
-- a CAPTCHA → log `skipped:captcha`, dismiss the modal, continue.
-- a screen that says you're not eligible / role unavailable → log `skipped:not_eligible`, continue.
-- an unrecognised form state after 15 step iterations → log `skipped:unknown_state`, continue.
+- a CAPTCHA → log `skipped:captcha`, dismiss the modal, exit subagent.
+- "not eligible" / role unavailable → log `skipped:not_eligible`, exit subagent.
+- an unrecognised state after 15 step iterations → log `skipped:unknown_state`, exit subagent.
 
-### 4d. Record success
+On submission confirmation:
 
-On submission confirmation, append:
 ```
-python3 state.py append --user_id X --kind log --row '{"platform":"linkedin","url":"...","company":"...","role":"...","status":"applied"}'
+state.py append --user_id X --kind log --row '{"platform":"linkedin","url":"...","company":"...","role":"...","status":"applied"}'
 ```
 
-Then sleep 30–90 seconds before the next job.
+Then emit `Applied: <company>/<role>. Discarding form DOM.` and exit the subagent. The parent dispatcher handles pacing and the next spawn.
 
----
+For form-question rules see `references/form_question_rules.md`. For hard rules see `references/safety.md`.
 
-## Step 5 — Answering form questions (the heart of the skill)
+## Pacing (per-context, do not lower)
 
-**Answer all fields on a modal step in a single LLM pass.** Do not loop field-by-field — that wastes 5–12× more LLM round-trips per form. Instead, per step:
+| Action | Wait |
+|---|---|
+| Between page actions inside a context | 4–10 s |
+| Between successful submissions inside a context | 30–90 s |
 
-1. Read every visible field in one DOM scan and produce a JSON array:
-   ```
-   [{"field_id": "...", "label": "What is your phone number?", "type": "tel", "options": null, "required": true}, ...]
-   ```
-   Use whatever stable identifier the platform exposes (`name` attribute, `aria-labelledby`, or a synthesised index) as `field_id`.
-2. Read `memory.json` once at the start of the run and keep it in working memory. For each field, compute the SHA-1 of the lowercased, whitespace-collapsed `label` and check the cache; pre-fill answers for any cache hits.
-3. For the remaining (unanswered) fields, issue **one** LLM call with this context:
-   - the array of unanswered fields,
-   - the user's `profile.json`,
-   - the JD text for this job (from step 4c),
-   - the resume text (parsed once at run start),
-   - the company and role,
-   - the four-class rules below.
+Concurrent contexts must each respect these — concurrency is not a license to speed up.
 
-   Ask the LLM for a JSON array `[{"field_id": "...", "answer": "..."}]`. Each `answer` is the value to fill (string, number, or one of the field's `options`). Use the literal value `null` for any required factual field the LLM genuinely cannot resolve.
-4. Apply each answer to its field. If any answer is `null` and the field is required, emit a pending question to the user about that field, log `skipped:needs_factual`, and abandon this job.
-5. Write all newly-resolved (non-cached) answers back to `memory.json` in **one** write at the end of the step (not per-field).
+## Safety caps
 
-The four classification rules below tell the LLM *how* to answer each field; it applies them inline during the batch call.
+- 25 successful applications per platform per user per day.
+- If a platform raises a session/CAPTCHA error, that loop stops; the other keeps going.
 
-### Class A — factual (PII, contact, location)
-Examples: full name, email, phone, address, city, ZIP, country, LinkedIn URL.
+## Termination + summary (parent dispatcher)
 
-Resolution:
-1. Look up the corresponding `profile.json` field. Use it.
-2. If genuinely missing, **ask the user** ("What address should I use for <user_id>?"). Save the answer to `profile.json` so we never re-ask. Continue filling.
-3. If the user is unavailable (no answer within ~2 minutes) and the field is required, log `skipped:needs_factual` and move on.
+Stop when any is true: `applied == target_count`, all queues exhausted, or both platforms capped.
 
-### Class B — eligibility (sponsorship, authorization, relocate, EEO, work mode, citizenship)
-Examples: "Are you authorized to work in the US?", "Do you require sponsorship now or in the future?", "Are you willing to relocate?", veteran/disability/race questions.
-
-Resolution:
-1. Read `profile.json`. The bootstrap captured every standard eligibility question — use those values.
-2. If you encounter a novel eligibility question that doesn't map to an existing `profile.json` field, ask the user once in chat, save the answer to a new `profile.json` field with a sensibly named key, and continue. Never re-ask.
-
-### Class C — skill_years (years of experience with X)
-Examples: "How many years of experience do you have with Python?", "Years using Snowflake?".
-
-Resolution:
-- Read `profile.json`. If `skill_years[<skill>]` is present, that is the user's actual.
-- Parse the JD for any "N+ years" / "N-M years" / "minimum N years" requirement specific to that skill. Take the max of the requirement and the user's actual. Default to `default_years` if the user has no entry for the skill.
-- **Never enter a number below the JD's stated requirement** — applying with insufficient stated experience is a waste of effort.
-- Don't claim ridiculous experience (>30 years) — clamp to a believable max if the JD demands more.
-
-### Class D — open_ended (essays, "why this company", "tell us about a project")
-Resolution:
-- Write a concise first-person reply, 90–160 words, professional tone, tailored to:
-  - the company (read its name and any context visible on the page),
-  - the role,
-  - the user's resume content (extract from the PDF at `resume_path` once at the start of the run and keep the text in your context),
-  - the JD.
-- Avoid clichés ("I'm a passionate..." / "rockstar"), filler, and generic statements. Reference one or two specific things from the JD or the company.
-- Cache the answer in `memory.json` keyed by `(company, role, question_hash)` so you don't re-write the same essay for the same opportunity.
-
-### Caching rules
-- Class A answers cache forever in `profile.json`.
-- Class B answers cache forever in `profile.json`.
-- Class C answers cache per skill in `profile.json` only if you asked the user; JD-derived computations don't get cached (they vary by JD).
-- Class D answers cache in `memory.json` keyed by `(company_lower, role_lower, question_hash)`.
-- Generic Class A/B answers (after first ask) also cache in `memory.json` keyed by `question_hash` so any future form with the same wording resolves instantly.
-
----
-
-## Step 6 — Termination and summary
-
-Stop when **any** of these is true:
-- `applied` count equals `target_count`.
-- All (platform, title) queues are exhausted.
-- Both platforms are capped for the day.
-
-Then send a **single chat message** to the user using exactly this format:
+Send exactly one chat message:
 
 ```
 Batch Complete for <user_id>. Total Applied: <X>. Platforms: LinkedIn (<Y>), Indeed (<Z>). Log: <log_path>
 ```
 
-Where `<log_path>` is the `log_path` field returned by `state.py read --user_id <user_id> --kind status` (it is an absolute path resolved at runtime). Counts come from the same status output.
+`<log_path>` and counts come from `state.py read --user_id <user_id> --kind status`. If skips of one kind exceed 5 (e.g. many `skipped:captcha`), append one short sentence. Otherwise the single line is the entire reply.
 
-If you had to skip jobs in interesting ways (more than 5 skips of the same kind, e.g. many `skipped:captcha`), append one extra short sentence so the user knows what happened. Otherwise the single line is the entire reply — do not narrate the run.
+## Status check (no apply)
 
----
-
-## Status / health check (no apply)
-
-If the user just asks "how am I doing?" or "status of <user_id>?", run:
-
-```
-python3 state.py read --user_id <user_id> --kind status
-```
-
-Format the JSON into a one-line chat message: applied count, per-platform breakdown, sessions valid?, profile present?
-
----
-
-## Things you must not do
-
-- Do not lower the per-context pacing (4–10 s between actions, 30–90 s between submissions) just because two contexts are running concurrently — that defeats the anti-detection purpose.
-- Do not bypass the dedup check ever.
-- Do not retry a failed login more than twice without asking the user for help.
-- Do not invent factual data (addresses, phone numbers, work history) — always read from `profile.json` or ask.
-- Do not lie on Class B questions (e.g. claiming work authorization the user doesn't have). If the user's eligibility says they need sponsorship and the JD says "must not require sponsorship", log `skipped:not_eligible` and move on.
-- Do not write essays longer than 200 words — recruiters skim.
-- Do not store credentials anywhere except via `state.py set_cred`.
+If the user asks "how am I doing?" / "status of <user_id>?", run `state.py read --user_id <user_id> --kind status` and reply in one line: applied count, per-platform breakdown, sessions valid?, profile present?
