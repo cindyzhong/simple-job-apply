@@ -34,7 +34,7 @@ If titles are a single string, split on commas / and / & and confirm the parsed 
 
 This bounds each subagent's working context to a single posting and lets each one start with a fresh prompt cache. **Do not loop multiple applications inside one subagent** — that is what blew up prior runs.
 
-The parent may run LinkedIn and Indeed subagents concurrently, but each individual subagent applies to exactly one job.
+The parent may run LinkedIn and Indeed subagents concurrently, but each individual subagent applies to exactly one job. Default concurrency cap: **at most 2 in-flight subagents at any time** (one per platform). Higher concurrency does not help — per-platform pacing dominates wall time and risks anti-automation flags.
 
 ## Step 0 — Preload (once per subagent)
 
@@ -73,6 +73,8 @@ Click Apply. For each form step:
 2. Read every visible field in one DOM scan and batch-fill per `references/form_question_rules.md`.
 3. Click Next/Continue/Review.
 
+**Scope every DOM read.** Never request the full page. In order of preference: `[role="dialog"] form`, then the nearest `<form>` element to the Apply button, then a labelled `<section>`. The job feed, sidebar, recommendations, and ads outside the dialog are noise — do not read them into context.
+
 **After clicking Next, the previous step's DOM is no longer relevant.** Do not re-read it, do not reference it. Treat each step as a fresh page. This keeps the subagent's working context bounded.
 
 Continue until you reach Submit. Click Submit, wait for the confirmation state (banner / toast / "Application sent" / new modal).
@@ -88,7 +90,13 @@ On submission confirmation:
 state.py append --user_id X --kind log --row '{"platform":"linkedin","url":"...","company":"...","role":"...","status":"applied"}'
 ```
 
-Then emit `Applied: <company>/<role>. Discarding form DOM.` and exit the subagent. The parent dispatcher handles pacing and the next spawn.
+Then emit one final assistant message in this exact form and stop — no further tool calls:
+
+```
+Applied: <company>/<role>. Discarding form DOM.
+```
+
+The parent dispatcher reads that line, handles pacing, and respawns for the next job. If you skipped (CAPTCHA / not_eligible / unknown_state / needs_factual / external_ats / duplicate), the final message is `Skipped:<reason>: <company>/<role>` instead — same rule, no further tool calls.
 
 For form-question rules see `references/form_question_rules.md`. For hard rules see `references/safety.md`.
 
